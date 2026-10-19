@@ -1,5 +1,5 @@
 ﻿<#
-  核显省电工具箱（中文界面）
+  同方核显省电工具箱（中文界面）
   ---------------------------------------------------------------------------
   给"不熟悉电脑的人"用的入口：双击 -> 自动请求管理员 -> 中文菜单 -> 一键出报告。
   它只做只读的事（读 EC / 固件变量 / 注册表 / 设备状态），绝不会改动硬件。
@@ -76,7 +76,7 @@ function New-ReportPath {
 function Show-Header {
     Write-Host ''
     Write-Cn '=================================================' Cyan
-    Write-Cn '            核显省电工具箱  (只读体检)' Cyan
+    Write-Cn '            同方核显省电工具箱  (只读体检)' Cyan
     Write-Cn '=================================================' Cyan
     Write-Cn (" 电脑名称 : {0}" -f $env:COMPUTERNAME)
     Write-Cn (" 当前用户 : {0}" -f [System.Security.Principal.WindowsIdentity]::GetCurrent().Name)
@@ -88,7 +88,7 @@ function Show-Header {
 function Show-Usage {
     Write-Host ''
     Write-Cn '【怎么用】' Yellow
-    Write-Cn '  1) 双击「双击运行-核显省电工具箱.cmd」，弹出"用户账户控制"时点【是】。'
+    Write-Cn '  1) 双击「双击运行-同方核显省电工具箱.cmd」，弹出"用户账户控制"时点【是】。'
     Write-Cn '  2) 只想看看这台机器的情况  ->  选 1（会在桌面生成一份报告）。'
     Write-Cn '  3) 要试"切到核显档"前后有什么变化  ->  选 2，然后按屏幕提示操作。'
     Write-Cn '  4) 把桌面上生成的"OEM显卡报告_....txt"发给开发者就行。'
