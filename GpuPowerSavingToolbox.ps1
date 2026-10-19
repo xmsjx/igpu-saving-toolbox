@@ -205,7 +205,13 @@ function Invoke-Engine {
     if ($ReportPath) { $all += @('-LogPath', $ReportPath) }
     $script:LastExitCode = $null
     try {
-        $out = (& $script:PSExe @all 2>&1 | Out-String)
+        # 实时流式显示：边跑边打印，同时把全文收进 $out 供上层做摘要
+        $sb = New-Object System.Text.StringBuilder
+        & $script:PSExe @all 2>&1 | ForEach-Object {
+            [void]$sb.AppendLine([string]$_)
+            Write-Host $_
+        }
+        $out = $sb.ToString()
         $script:LastExitCode = $LASTEXITCODE
         return $out
     } catch {
@@ -587,7 +593,7 @@ function Invoke-ForceSilence {
          1) 清占用        —— 结束占用独显的进程（系统/桌面等保护名单除外）
          2) 硬件层切走    —— 仅 support=85 的机型；写 ACPI 选择子把独显断电/摘除（三项验证，失败自动回滚）
          3) 软件层禁用    —— PnP 禁用（可选彻底模式：再把设备节点移除，程序连枚举都看不到）
-       顺序按厂商的做法：先清占用 → 再固件切走 → 最后设备层兜底。 #>
+       顺序按厂商的做法：先清占用 -> 再固件切走 -> 最后设备层兜底。 #>
     Write-Host ''
     Write-Cn '这一步是"强制静默"：即使有程序正在使用独显，也会先把它们关掉，再让独显消失。' Yellow
     Write-Cn '  * 会强制关闭占用独显的程序，未保存的内容会丢失；' Yellow
@@ -667,11 +673,105 @@ function Invoke-ForceSilence {
         4 { [void]$sum.Add('第 3 步：禁用失败，详见报告。') }
         default { [void]$sum.Add(('第 3 步：退出码 {0}，详见报告。' -f $code3)) }
     }
-    [void]$sum.Add('恢复顺序：菜单 8（恢复设备）→ 需要时菜单 10（热切还原）。')
+    [void]$sum.Add('恢复顺序：菜单 8（恢复设备）-> 需要时菜单 10（热切还原）。')
 
     foreach ($l in $sum) { Write-Cn ('  * ' + $l) Green }
     Add-ReportHeader -ReportPath $report -Action ('强制静默（{0}模式）' -f $(if ($thorough) { '彻底' } else { '标准' })) -Summary $sum
     Show-ReportResult -ReportPath $report
+}
+
+function Invoke-GpuPowerLimit {
+    <# GPU 功耗上限 / Dynamic Boost：通过 EC 写入调整（仅在 4060 测试机验证过）。
+       默认只读预演；写入需 YES 确认；可回滚到进入前原值。 #>
+    Write-Host ''
+    $engine = Join-Path $script:Root 'GpuPowerLimit.ps1'
+    if (-not (Test-Path -LiteralPath $engine)) {
+        Write-Cn ('找不到文件：{0}' -f $engine) Red
+        Write-Cn '请确认它和工具箱在同一个文件夹里。' Red
+        return
+    }
+    Write-Cn '注意：本功能直接写 EC 字节来调整 GPU 功耗上限（Dynamic Boost）。' Yellow
+    Write-Cn '      参考实现：目前只在 4060 上验证过；其它机型请先只读确认地址与字节含义。' Yellow
+    Write-Host ''
+    Write-Cn '第一步：只读查看当前状态（不会写任何字节）...' Cyan
+    $st = Invoke-Engine -EngineArgs @('-Action', 'Status') -Title '查看 GPU 功耗 / DB 状态' -EnginePath $engine
+    $st
+    if ($script:LastExitCode -ne 0) {
+        Write-Cn '读取失败：多为未以管理员运行，或本机没有 ACPIDriver。' Yellow
+        return
+    }
+
+    Write-Host ''
+    Write-Cn '选择要设置的最大 Dynamic Boost（4060 参考值）：' Yellow
+    # 从驱动读取本机显卡的功耗范围，动态显示（不同显卡默认 TGP / DB 上限不同）
+    $smi = Join-Path $env:SystemRoot 'System32\nvidia-smi.exe'
+    $gpuDef = -1; $gpuMax = -1
+    try {
+        $ln = & $smi --query-gpu=power.default_limit,power.max_limit --format=csv,noheader 2>$null
+        if ("$ln" -match '([0-9.]+)\s*W,\s*([0-9.]+)\s*W') { $gpuDef = [double]$Matches[1]; $gpuMax = [double]$Matches[2] }
+    } catch { }
+    if ($gpuDef -gt 0) {
+        $dbMaxW = [int]($gpuMax - $gpuDef)
+        Write-Cn ('本机显卡: 默认 {0}W / 最大 {1}W（DB 可调 0..{2}W）' -f $gpuDef, $gpuMax, $dbMaxW) Cyan
+        Write-Cn ('  1 = 最大 DB {0}W  -> 约 {1}W' -f $dbMaxW, [int]$gpuMax)
+        Write-Cn ('  2 = 约 2/3  {0}W  -> 约 {1}W' -f [int]($dbMaxW*2/3), [int]($gpuDef + [int]($dbMaxW*2/3)))
+        Write-Cn ('  3 = 约 1/3  {0}W  -> 约 {1}W' -f [int]($dbMaxW/3), [int]($gpuDef + [int]($dbMaxW/3)))
+        Write-Cn ('  4 = 0W  -> 约 {0}W（等同关闭 DB）' -f [int]$gpuDef)
+    } else {
+        Write-Cn '读不到显卡功耗范围（nvidia-smi 不可用），将使用默认档位：' Yellow
+        Write-Cn '  1 = 最大 DB    2 = 约 2/3    3 = 约 1/3    4 = 0W（关闭 DB）'
+        $dbMaxW = 25
+    }
+    Write-Cn '  5 = 回滚到进入前记录的原值'
+    Write-Cn '  6 = 查看「离电参考值」（只读，不写入 EC）'
+    Write-Cn '  7 = 单字节实验（仅限已确认地址 743/745/746/7D4/7D5）'
+    Write-Cn '  0 = 取消'
+    $pick = Read-Host '输入 1~7 或 0 再回车'
+
+    if ($pick -eq '6') {
+        $out = Invoke-Engine -EngineArgs @('-Action', 'LockLow') -Title '查看离电参考值（只读，不写入）' -EnginePath $engine
+        $out
+        Write-Cn '恢复：本菜单 5 回滚，或重启。' Yellow
+        return
+    }
+    if ($pick -eq '7') {
+        $a = Read-Host '输入地址（十六进制，例如 7C4）'
+        $v = Read-Host '输入值（十六进制，例如 20）'
+        try {
+            $addr = [Convert]::ToInt32(($a -replace '^0[xX]',''), 16)
+            $val  = [Convert]::ToInt32(($v -replace '^0[xX]',''), 16)
+        } catch { Write-Cn '输入无效，已取消。' Yellow; return }
+        $out = Invoke-Engine -EngineArgs @('-Action', 'SetByte', '-Addr', [string]$addr, '-Value', [string]$val, '-Yes') -Title ('单字节实验 0x{0:X3} = 0x{1:X2}' -f $addr, $val) -EnginePath $engine
+        $out
+        Write-Cn '恢复：本菜单 5 回滚。' Yellow
+        return
+    }
+    if ($pick -eq '5') {
+        $out = Invoke-Engine -EngineArgs @('-Action', 'Restore', '-Yes') -Title '回滚 EC 到原值' -EnginePath $engine
+        $out
+        return
+    }
+    if ($pick -eq '0' -or $pick -eq '') { Write-Cn '已取消，没有写入任何字节。' Yellow; return }
+    if ($gpuDef -gt 0) {
+        $dbMaxW = [int]($gpuMax - $gpuDef)
+        $watt = switch ($pick) { '1' { $dbMaxW } '2' { [int]($dbMaxW*2/3) } '3' { [int]($dbMaxW/3) } '4' { 0 } default { -1 } }
+    } else {
+        $watt = switch ($pick) { '1' { 25 } '2' { 15 } '3' { 5 } '4' { 0 } default { -1 } }
+    }
+    if ($watt -lt 0) { Write-Cn '输入无效，已取消。' Yellow; return }
+
+    Write-Host ''
+    Write-Cn '预演：下面是即将写入的字节（本次不写）...' Cyan
+    $dry = Invoke-Engine -EngineArgs @('-Action', 'EnableDb', '-DbWatt', [string]$watt, '-WhatIf') -Title '预演（未写入）' -EnginePath $engine
+    $dry
+    Write-Cn '确认写入吗？写入会立即改变 GPU 功耗上限；可用本菜单 5 回滚。' Yellow
+    $ans = Read-Host '输入 YES 再回车继续（其它输入取消）'
+    if ($ans -ne 'YES') { Write-Cn '已取消，没有写入任何字节。' Yellow; return }
+
+    $out = Invoke-Engine -EngineArgs @('-Action', 'EnableDb', '-DbWatt', [string]$watt, '-Yes') -Title ('写入 DB={0}W' -f $watt) -EnginePath $engine
+    $out
+    Write-Cn '提示：DB 是动态的 —— GPU 有负载时才维持高档，负载停止后固件会回收。' Yellow
+    Write-Cn '恢复：本菜单 5 回滚，或切一次性能模式 / 重启。' Yellow
 }
 
 Show-Header
@@ -689,6 +789,7 @@ while ($true) {
     Write-Cn ' 10) 热切还原：把切走的独显切回来'
     Write-Cn ' 11) 强制静默（彻底）：清占用 + 软硬双层，就算有程序在用也做'
     Write-Cn (' 12) 报告开关：当前【{0}】（切换"是否在桌面生成报告文件"）' -f $(if (Test-ReportEnabled) { '开' } else { '关' }))
+    Write-Cn ' 13) GPU 功耗上限 / Dynamic Boost（写 EC，仅 4060 实测）'
     Write-Cn '  ?) 使用说明'
     Write-Cn '  0) 退出'
     $c = Read-Host '输入数字后按回车'
@@ -713,10 +814,11 @@ while ($true) {
                 Write-Cn '设置保存失败（权限问题），本次状态未改变。' Red
             }
         }
+'13' { Invoke-GpuPowerLimit }
         '?' { Show-Usage }
         '0' { Write-Cn '已退出。'; exit 0 }
         $null { Write-Cn '（没有输入，自动退出）' Yellow; exit 0 }
-        default { Write-Cn '请输入 1~12、? 或 0。' Yellow }
+default { Write-Cn '请输入 1~13、? 或 0。' Yellow }
     }
     Write-Host ''
     Write-Cn ('（最近的报告：{0}）' -f $(if ($script:LastLog) { $script:LastLog } else { '还没生成' }))
